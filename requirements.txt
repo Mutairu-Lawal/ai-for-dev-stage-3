@@ -6,3 +6,4 @@ sentence-transformers
 google-generativeai
 PyPDF2
 python-docx
+python-multipart

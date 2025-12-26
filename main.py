@@ -1,6 +1,3 @@
-# Python RAG template (FastAPI)
-# Endpoints: /upload, /prompt, /rechunk
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uuid
@@ -30,14 +27,14 @@ except:
 # Load environment variables
 load_dotenv()
 
-HF_TOKEN = os.getenv('HF_TOKEN')
+HF_TOKEN = os.getenv('HF_TOKEN', '')
 EMBED_MODEL_NAME = os.getenv('EMBED_MODEL_NAME', 'all-MiniLM-L6-v2')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'gpt-3.5-turbo')
-CHROMA_DB_HOST = os.getenv('CHROMA_DB_HOST')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'gemini-2.5-flash')
+CHROMA_DB_HOST = os.getenv('CHROMA_DB_HOST', '')
 RAG_DATA_DIR = os.getenv('RAG_DATA_DIR', './data')
 CHUNK_SIZE = int(os.getenv('CHUNK_LENGTH', '500'))
-CHUNK_OVERLAP = int(os.getenv('CHUNK_OVERLAP', '100'))
+CHUNK_OVERLAP = int(os.getenv('CHUNK_OVERLAP', '50'))
 PORT = int(os.getenv('PORT', '8080'))
 
 
@@ -186,10 +183,10 @@ async def upload_files(files: List[UploadFile] = File(...), context: Optional[st
                 metadata.append(meta)
 
         # upsert into chromadb
-        collection.upsert(documents=[v[2]["text"] for v in new_vectors],
-                          ids=[v[0] for v in new_vectors],
-                          metadatas=[v[2] for v in new_vectors],
-                          embeddings=[v[1] for v in new_vectors])
+        collection.add(documents=[v[2]["text"] for v in new_vectors],
+                       ids=[v[0] for v in new_vectors],
+                       metadatas=[v[2] for v in new_vectors],
+                       embeddings=[v[1] for v in new_vectors])
 
         # Save the metadata.
         with open(metadata_path, "w") as f:
@@ -203,76 +200,89 @@ async def upload_files(files: List[UploadFile] = File(...), context: Optional[st
 
 @app.post("/prompt")
 async def prompt(context: str = Form(...), query: str = Form(...)):
-    """Chat endpoint for querying the RAG system"""
     try:
-        # embed query
+        # Embed query
         qvec = embed_model.encode(query).tolist()
-        results = collection.query(vector=qvec, top_k=5,
-                                   include_metadata=True, where={"context": context})
 
-        retrieved = [m["metadata"]["text"] for m in results["matches"]]
+        results = collection.query(
+            query_embeddings=[qvec],
+            n_results=5,
+            include=["documents", "metadatas"]
+        )
+
+        # Chroma returns lists inside lists
+        if not results["documents"] or not results["documents"][0]:
+            raise HTTPException(
+                status_code=404,
+                detail="No matching documents found"
+            )
+
+        # Extract retrieved text
+        retrieved = results["documents"][0]
+
         context_block = "\n".join(retrieved)
 
-        # With LLM
         prompt_text = f"""
 Context:
-    {context_block}
+{context_block}
 
-    Question: {query}
-    
-    Based on the context provided above, generate a succinct answer to the query above.
+Question: {query}
+
+Based on the context provided above, generate a succinct answer.
 """
+
         response = llm_model.generate_content(prompt_text)
 
-        return {"answer": response.text, "context": retrieved}
+        return {
+            "answer": response.text,
+            "context": retrieved
+        }
+
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Error processing query: {str(e)}")
+            status_code=500,
+            detail=f"Error processing query: {str(e)}"
+        )
 
 
 @app.post("/rechunk")
 async def rechunk(payload: dict):
-    """
-    Re-chunk existing documents in a context with new chunk parameters.
-    Payload: {
-        "context": str,
-        "new_chunk_size": int (optional),
-        "new_chunk_overlap": int (optional)
-    }
-    """
     try:
         context = payload.get("context")
         if not context:
             raise HTTPException(
-                status_code=400, detail="Missing 'context' in payload")
+                status_code=400,
+                detail="Missing 'context' in payload"
+            )
 
-        new_size = payload.get("new_chunk_size", CHUNK_SIZE)
-        new_overlap = payload.get("new_chunk_overlap", CHUNK_OVERLAP)
+        new_size = int(payload.get("new_chunk_size", CHUNK_SIZE))
+        new_overlap = int(payload.get("new_chunk_overlap", CHUNK_OVERLAP))
 
-        # Get all documents in this context
-        results = collection.get(where={"context": context}, include=[
-                                 "documents", "metadatas"])
+        results = collection.get(
+            where={"context": context},
+            include=["documents", "metadatas"]
+        )
 
-        if not results["documents"]:
+        if not results["ids"]:
             return {"message": "No documents found for this context"}
 
-        # Get original files and re-chunk
         ctx_dir = os.path.join(RAG_DATA_DIR, context)
         file_dir = os.path.join(ctx_dir, "files")
 
         if not os.path.exists(file_dir):
             raise HTTPException(
-                status_code=404, detail="Context files not found")
+                status_code=404,
+                detail="Context files not found"
+            )
 
-        # Remove old chunks for this context
-        old_ids = results["ids"]
-        if old_ids:
-            collection.delete(ids=old_ids)
+        # Delete old chunks
+        collection.delete(ids=results["ids"])
 
-        # Re-process files
-        new_vectors = []
+        new_ids, new_docs, new_metas, new_embeds = [], [], [], []
+
         for filename in os.listdir(file_dir):
             file_path = os.path.join(file_dir, filename)
+
             with open(file_path, "rb") as f:
                 content = f.read()
 
@@ -280,40 +290,49 @@ async def rechunk(payload: dict):
             chunks = chunk_text(text, size=new_size, overlap=new_overlap)
 
             for chunk, (s, e) in chunks:
-                vec = embed_model.encode(chunk).tolist()
                 cid = uuid.uuid4().hex
-                meta = {
-                    "id": cid,
+                new_ids.append(cid)
+                new_docs.append(chunk)
+                new_metas.append({
                     "context": context,
                     "filename": filename,
                     "offset_start": s,
-                    "offset_end": e,
-                    "text": chunk,
-                }
-                new_vectors.append((cid, vec, meta))
+                    "offset_end": e
+                })
+                new_embeds.append(embed_model.encode(chunk).tolist())
 
-        # Upsert new chunks
-        if new_vectors:
-            collection.upsert(documents=[v[2]["text"] for v in new_vectors],
-                              ids=[v[0] for v in new_vectors],
-                              metadatas=[v[2] for v in new_vectors],
-                              embeddings=[v[1] for v in new_vectors])
+        if new_ids:
+            collection.upsert(
+                ids=new_ids,
+                documents=new_docs,
+                metadatas=new_metas,
+                embeddings=new_embeds
+            )
 
-        # Update metadata
         metadata_path = os.path.join(ctx_dir, "metadata.json")
-        metadata = [v[2] for v in new_vectors]
         with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(new_metas, f, indent=2)
 
         return {
             "message": "Rechunking completed",
             "context": context,
-            "new_chunks": len(new_vectors),
+            "new_chunks": len(new_ids),
             "new_chunk_size": new_size,
             "new_chunk_overlap": new_overlap
         }
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Error during rechunking: {str(e)}")
+            status_code=500,
+            detail=f"Error during rechunking: {str(e)}"
+        )
+
+
+@app.get("/health", status_code=200)
+async def health_check():
+    return {
+        "status": "ok",
+        "message": "App is live"
+    }
